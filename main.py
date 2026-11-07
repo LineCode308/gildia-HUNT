@@ -633,10 +633,10 @@ async def on_command_error(ctx, error):
 
 
 # =========================================================
-# URUCHOMIENIE
+# START
 # =========================================================
 
-app = Flask(name)
+app = Flask(__name__)
 
 
 @app.route("/")
@@ -657,10 +657,9 @@ def keep_alive():
 keep_alive()
 
 
-if name == "main":
+if __name__ == "__main__":
 
     if TOKEN == "TWÓJ_TOKEN":
         print("USTAW TOKEN BOTA W ZMIENNEJ TOKEN!")
 
     bot.run(TOKEN)
-
