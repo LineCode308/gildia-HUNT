@@ -1,15 +1,15 @@
-from flask import Flask
-
-
-
-
 
 import os
 import discord
 import asyncio
 
+
 from dotenv import load_dotenv
 from discord.ext import commands
+from threading import Thread
+from flask import Flask
+
+
 
 # =========================================================
 # KONFIGURACJA
