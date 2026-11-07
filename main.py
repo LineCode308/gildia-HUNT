@@ -3,12 +3,10 @@ import os
 import discord
 import asyncio
 
-
 from dotenv import load_dotenv
 from discord.ext import commands
 from threading import Thread
 from flask import Flask
-
 
 
 # =========================================================
@@ -29,7 +27,12 @@ GUILD_CHANNEL_ID = 123456789012345678  # UZUPEŁNIJ ID
 
 # TICKETY
 TICKET_PANEL_CHANNEL_ID = 1568699441488076832
-TICKET_CATEGORY_ID = 123456789012345678  # UZUPEŁNIJ ID
+
+# OSOBNE KATEGORIE TICKETÓW
+RECRUITMENT_CATEGORY_ID = 123456789012345678  # ID KATEGORII REKRUTACJA
+ALLIANCE_CATEGORY_ID = 123456789012345678     # ID KATEGORII SOJUSZ
+QUESTION_CATEGORY_ID = 123456789012345678     # ID KATEGORII PYTANIA
+
 STAFF_ROLE_ID = 123456789012345678  # UZUPEŁNIJ ID
 
 # KOLOR EMBEDÓW
@@ -146,12 +149,29 @@ async def create_ticket(interaction, ticket_type, answers):
         )
         return
 
-    category = guild.get_channel(TICKET_CATEGORY_ID)
+    # WYBÓR KATEGORII W ZALEŻNOŚCI OD TYPU TICKETU
+
+    category_ids = {
+        "Rekrutacja": RECRUITMENT_CATEGORY_ID,
+        "Sojusz": ALLIANCE_CATEGORY_ID,
+        "Pytanie": QUESTION_CATEGORY_ID
+    }
+
+    category_id = category_ids.get(ticket_type)
+
+    if category_id is None:
+        await interaction.response.send_message(
+            "❌ Nie znaleziono konfiguracji tej kategorii ticketu.",
+            ephemeral=True
+        )
+        return
+
+    category = guild.get_channel(category_id)
     staff_role = guild.get_role(STAFF_ROLE_ID)
 
     if category is None or not isinstance(category, discord.CategoryChannel):
         await interaction.response.send_message(
-            "❌ Nie znaleziono kategorii ticketów. Sprawdź TICKET_CATEGORY_ID.",
+            f"❌ Nie znaleziono kategorii dla ticketu: {ticket_type}. Sprawdź jej ID.",
             ephemeral=True
         )
         return
@@ -615,9 +635,7 @@ async def test_powitanie(ctx):
 # OBSŁUGA BŁĘDÓW
 # =========================================================
 
-
 @bot.event
-
 async def on_command_error(ctx, error):
 
     if isinstance(error, commands.MissingPermissions):
