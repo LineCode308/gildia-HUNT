@@ -69,6 +69,7 @@ TICKET_TYPES = {
         "title": "REKRUTACJA",
         "description": "Dołącz do gildii HUNT.",
         "emoji": EMOJI_RECRUITMENT,
+        "fallback_emoji": "📝",
         "category_id": 1568749095517036705,
     },
     "sojusz": {
@@ -76,6 +77,7 @@ TICKET_TYPES = {
         "title": "SOJUSZ",
         "description": "Zaproponuj współpracę lub sojusz.",
         "emoji": EMOJI_ALLIANCE,
+        "fallback_emoji": "🤝",
         "category_id": 1568749019197608057,
     },
     "pytanie": {
@@ -83,6 +85,7 @@ TICKET_TYPES = {
         "title": "POMOC / PYTANIE",
         "description": "Masz pytanie lub potrzebujesz pomocy?",
         "emoji": EMOJI_QUESTION,
+        "fallback_emoji": "❓",
         "category_id": 1568748991749816530,
     },
 }
@@ -135,6 +138,23 @@ def clip(text: str, limit: int) -> str:
     if not text:
         return "Nie podano"
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def resolve_emoji(raw: str, fallback: str) -> str:
+    """Zwraca emoji serwerowe tylko jeśli bot je widzi, w przeciwnym razie zwykłe emoji.
+
+    Discord odrzuca CAŁY panel, gdy ID emoji w menu jest błędne,
+    więc sprawdzamy to wcześniej.
+    """
+    match = re.fullmatch(r"<a?:\w+:(\d+)>", raw or "")
+    if not match:
+        return raw or fallback
+    if not bot.is_ready():
+        return fallback
+    if bot.get_emoji(int(match.group(1))) is None:
+        print(f"Uwaga: emoji {raw} nie istnieje lub bot go nie widzi - używam zastępczego.")
+        return fallback
+    return raw
 
 
 def owner_topic(user_id: int) -> str:
@@ -521,7 +541,7 @@ class TicketPanelSelect(discord.ui.Select):
                 label=data["label"],
                 description=data["description"],
                 value=key,
-                emoji=data["emoji"],
+                emoji=resolve_emoji(data["emoji"], data["fallback_emoji"]),
             )
             for key, data in TICKET_TYPES.items()
         ]
@@ -583,7 +603,8 @@ class TicketPanel(discord.ui.LayoutView):
         super().__init__(timeout=None)
 
         categories = "\n".join(
-            f"{data['emoji']} **{data['label']}** — {data['description']}"
+            f"{resolve_emoji(data['emoji'], data['fallback_emoji'])} "
+            f"**{data['label']}** — {data['description']}"
             for data in TICKET_TYPES.values()
         )
 
