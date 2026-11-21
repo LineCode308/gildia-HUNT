@@ -1,13 +1,13 @@
-
-import os
-import discord
 import asyncio
+import logging
+import os
+import re
+import threading
 
-from dotenv import load_dotenv
+import discord
 from discord.ext import commands
-from threading import Thread
+from dotenv import load_dotenv
 from flask import Flask
-
 
 # =========================================================
 # KONFIGURACJA
@@ -17,76 +17,606 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-if not TOKEN:
-    raise ValueError("Nie znaleziono DISCORD_TOKEN w pliku .env!")
-
-# POWITANIA
 WELCOME_CHANNEL_ID = 1567940953040232551
 AUTO_ROLE_ID = 1568694462601887956
-GUILD_CHANNEL_ID = 123456789012345678  # UZUPEŁNIJ ID
-
-# TICKETY
 TICKET_PANEL_CHANNEL_ID = 1568699441488076832
 
-# OSOBNE KATEGORIE TICKETÓW
-RECRUITMENT_CATEGORY_ID = 123456789012345678  # ID KATEGORII REKRUTACJA
-ALLIANCE_CATEGORY_ID = 123456789012345678     # ID KATEGORII SOJUSZ
-QUESTION_CATEGORY_ID = 123456789012345678     # ID KATEGORII PYTANIA
+# !!! WPISZ PRAWDZIWE ID ROLI ZARZĄDU - to jest tylko przykład !!!
+STAFF_ROLE_ID = 123456789012345678
 
-STAFF_ROLE_ID = 123456789012345678  # UZUPEŁNIJ ID
+# Uwaga: linki z cdn.discordapp.com mają parametry ex/is/hm i WYGASAJĄ.
+# Najlepiej wrzucić obrazek na stałe miejsce (np. imgur / własny hosting).
+TICKET_IMAGE_URL = (
+    "https://cdn.discordapp.com/attachments/"
+    "1569024383845007511/1569024402711126026/"
+    "5d4b881e-20fd-426d-a936-9bd414d1f03a.png"
+    "?ex=6af1f358&is=6af0a1d8"
+    "&hm=1d10754b5a9621c52085746e3226e4ba31d31541f97e78d601ca7c25d6a571e5&"
+)
 
-# KOLOR EMBEDÓW
-COLOR = discord.Color.from_rgb(0, 0, 0)
+# Czysty rgb(0,0,0) Discord traktuje jak "brak koloru" (szary pasek),
+# więc używamy prawie-czerni.
+COLOR = discord.Colour(0x010101)
+
+PORT = int(os.getenv("PORT", "8080"))
+
+# =========================================================
+# EMOJI
+# =========================================================
+
+EMOJI_MEMBER = "<:czlonek:1567976307302735902>"
+EMOJI_SUPER = "<:super:1567984387457421473>"
+EMOJI_RULES = "<:regulamin:1567980863826690159>"
+EMOJI_TICKET = "<:ticket:1567981310788509786>"
+EMOJI_WELCOME = "<:witaj:1567978044956737587>"
+
+EMOJI_RECRUITMENT = "<a:rekrutacja:1568746446528716920>"
+EMOJI_ALLIANCE = "<:sojusz:1568745977316114545>"
+EMOJI_QUESTION = "<:pytanie:1568742288249816530>"
+EMOJI_WARNING = "<:warning:1568745877059670086>"
+
+EMOJI_PERSON = "<:osoba_:1569027160235319306>"
+EMOJI_HASHTAG = "<:hasztag_:1569027212085043330>"
+EMOJI_PENCIL = "<:Dlugopis_:1569027448945905744>"
+
+# =========================================================
+# KATEGORIE TICKETÓW (jedno miejsce konfiguracji)
+# =========================================================
+
+TICKET_TYPES = {
+    "rekrutacja": {
+        "label": "Rekrutacja",
+        "title": "REKRUTACJA",
+        "description": "Dołącz do gildii HUNT.",
+        "emoji": EMOJI_RECRUITMENT,
+        "category_id": 1568749095517036705,
+    },
+    "sojusz": {
+        "label": "Sojusz",
+        "title": "SOJUSZ",
+        "description": "Zaproponuj współpracę lub sojusz.",
+        "emoji": EMOJI_ALLIANCE,
+        "category_id": 1568749019197608057,
+    },
+    "pytanie": {
+        "label": "Pomoc / Pytanie",
+        "title": "POMOC / PYTANIE",
+        "description": "Masz pytanie lub potrzebujesz pomocy?",
+        "emoji": EMOJI_QUESTION,
+        "category_id": 1568748991749816530,
+    },
+}
+
+# =========================================================
+# FLASK - KEEP ALIVE
+# =========================================================
+
+app = Flask(__name__)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+
+@app.route("/")
+def home():
+    return "HUNT BOT ONLINE!"
+
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
 
 
 # =========================================================
-# INTENTS
+# BOT
 # =========================================================
 
 intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
+intents.members = True          # włącz "Server Members Intent" w Developer Portal
+intents.message_content = True  # włącz "Message Content Intent" w Developer Portal
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
+
+class HUNTBot(commands.Bot):
+
+    async def setup_hook(self):
+        # widoki persistent - działają po restarcie bota
+        self.add_view(TicketPanel())
+        self.add_view(CloseTicketView())
+
+
+bot = HUNTBot(command_prefix="!", intents=intents)
+panel_sent = False
+
+# =========================================================
+# FUNKCJE POMOCNICZE
+# =========================================================
+
+
+def clip(text: str, limit: int) -> str:
+    """Przycina tekst do limitu Discorda."""
+    text = (text or "").strip()
+    if not text:
+        return "Nie podano"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def owner_topic(user_id: int) -> str:
+    return f"ticket-owner:{user_id}"
+
+
+def find_open_ticket(guild: discord.Guild, user_id: int):
+    """Zwraca otwarty ticket użytkownika (lub None)."""
+    topic = owner_topic(user_id)
+    for channel in guild.text_channels:
+        if channel.topic == topic:
+            return channel
+    return None
+
+
+def is_staff(member: discord.Member, guild: discord.Guild) -> bool:
+    staff_role = guild.get_role(STAFF_ROLE_ID)
+    if staff_role and staff_role in member.roles:
+        return True
+    return member.guild_permissions.administrator
 
 
 # =========================================================
-# EMBED POWITALNY
+# POWITANIE
 # =========================================================
 
-def create_welcome_embed(member):
+
+def create_welcome_embed(member: discord.Member) -> discord.Embed:
 
     embed = discord.Embed(
-        title="GILDIA HUNT × POWITANIA",
+        title=f"{EMOJI_WELCOME} WITAJ W GILDII HUNT!",
         description=(
-            f"> <:czlonek:1567976307302735902> Witaj na **GILDI HUNT!** "
-            f"Jesteś **{member.guild.member_count} osobą na serwerze**\n\n"
-
-            f"> <:super:1567984387457421473> Miło Cię widzieć na HUNT!\n"
-            f"> Mamy nadzieję, że nie opuścisz nas i zostaniesz na dłużej!\n\n"
-
-            f"**> <:regulamin:1567980863826690159> "
-            f"Zapoznaj się z regulaminem.**\n\n"
-
-            f"**> <:ticket:1567981310788509786> "
-            f"Aby dołączyć do naszej gildii, stwórz ticket na kanale** "
-            f"<#{GUILD_CHANNEL_ID}>."
+            f"Siema {member.mention}!\n\n"
+            f"{EMOJI_MEMBER} Jesteś naszym członkiem!\n"
+            f"{EMOJI_RULES} Zapoznaj się z regulaminem.\n"
+            f"{EMOJI_SUPER} Życzymy miłej gry!"
         ),
-        color=COLOR
+        color=COLOR,
+        timestamp=discord.utils.utcnow(),
     )
 
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text="HUNT • Witamy na serwerze")
+    embed.set_footer(
+        text=f"GILDIA HUNT • Łącznie członków: {member.guild.member_count}"
+    )
+
+    return embed
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+
+    role = member.guild.get_role(AUTO_ROLE_ID)
+
+    if role:
+        try:
+            await member.add_roles(role, reason="Automatyczna rola")
+        except discord.Forbidden:
+            print("Bot nie ma uprawnień do nadania roli (sprawdź hierarchię ról).")
+        except discord.HTTPException as error:
+            print(f"Błąd nadawania roli: {error}")
+
+    channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
+
+    if channel:
+        try:
+            await channel.send(embed=create_welcome_embed(member))
+        except discord.HTTPException as error:
+            print(f"Błąd wysyłania powitania: {error}")
+
+
+@bot.command(name="testpowitanie")
+@commands.has_permissions(administrator=True)
+async def test_powitanie(ctx: commands.Context):
+    await ctx.send(embed=create_welcome_embed(ctx.author))
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(f"{EMOJI_WARNING} Nie masz uprawnień do tej komendy.")
+        return
+    print(f"Błąd komendy: {error}")
+
+
+# =========================================================
+# EMBED TICKETA
+# =========================================================
+
+
+def create_ticket_embed(
+    user: discord.Member,
+    ticket_channel: discord.TextChannel,
+    ticket_type: str,
+    answers: dict,
+) -> discord.Embed:
+
+    title = TICKET_TYPES[ticket_type]["title"]
+
+    embed = discord.Embed(
+        title=f"TICKET • {title}",
+        description=(
+            f"{EMOJI_PERSON} **Zgłaszający:** {user.mention}\n"
+            f"{EMOJI_HASHTAG} **Kanał:** {ticket_channel.mention}\n"
+            f"{EMOJI_PENCIL} **Kategoria:** {title}"
+        ),
+        color=COLOR,
+        timestamp=discord.utils.utcnow(),
+    )
+
+    # Każda odpowiedź w osobnym polu - brak ryzyka przekroczenia limitu 4096 znaków
+    for question, answer in answers.items():
+        embed.add_field(
+            name=f"▸ {question}",
+            value=f">>> {clip(answer, 1000)}",
+            inline=False,
+        )
+
+    embed.set_author(
+        name="GILDIA HUNT • SYSTEM TICKET",
+        icon_url=user.guild.icon.url if user.guild.icon else None,
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.set_footer(text="HUNT • SYSTEM ZGŁOSZEŃ")
 
     return embed
 
 
 # =========================================================
+# TWORZENIE TICKETÓW
+# =========================================================
+
+
+async def create_ticket(
+    interaction: discord.Interaction,
+    ticket_type: str,
+    answers: dict,
+):
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+
+    if guild is None:
+        await interaction.followup.send(
+            f"{EMOJI_WARNING} Nie udało się znaleźć serwera.", ephemeral=True
+        )
+        return
+
+    # zabezpieczenie przed dublami (np. dwa szybkie kliknięcia)
+    existing = find_open_ticket(guild, interaction.user.id)
+    if existing:
+        await interaction.followup.send(
+            f"{EMOJI_WARNING} Masz już otwarty ticket: {existing.mention}",
+            ephemeral=True,
+        )
+        return
+
+    category = guild.get_channel(TICKET_TYPES[ticket_type]["category_id"])
+
+    if not isinstance(category, discord.CategoryChannel):
+        await interaction.followup.send(
+            f"{EMOJI_WARNING} Nie znaleziono kategorii na serwerze. "
+            "Sprawdź ID kategorii.",
+            ephemeral=True,
+        )
+        return
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        ),
+    }
+
+    staff_role = guild.get_role(STAFF_ROLE_ID)
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        )
+
+    if guild.me:
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            manage_channels=True,
+            read_message_history=True,
+            embed_links=True,
+        )
+
+    username = re.sub(
+        r"[^a-z0-9-]", "", interaction.user.name.lower().replace(" ", "-")
+    ) or str(interaction.user.id)[-4:]
+
+    channel_name = f"{ticket_type}-{username}"[:90]
+
+    try:
+        ticket_channel = await guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic=owner_topic(interaction.user.id),
+            reason=f"Ticket użytkownika {interaction.user}",
+        )
+
+        embed = create_ticket_embed(
+            interaction.user, ticket_channel, ticket_type, answers
+        )
+
+        await ticket_channel.send(
+            content=interaction.user.mention,
+            embed=embed,
+            view=CloseTicketView(),
+        )
+
+        await interaction.followup.send(
+            f"{EMOJI_TICKET} Utworzono ticket: {ticket_channel.mention}",
+            ephemeral=True,
+        )
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"{EMOJI_WARNING} Bot nie ma uprawnień do tworzenia kanałów ticketów.",
+            ephemeral=True,
+        )
+
+    except discord.HTTPException as error:
+        print(f"Błąd tworzenia ticketa: {error}")
+        await interaction.followup.send(
+            f"{EMOJI_WARNING} Wystąpił błąd podczas tworzenia ticketa.",
+            ephemeral=True,
+        )
+
+
+# =========================================================
+# FORMULARZE
+# =========================================================
+
+
+class RecruitmentModal(discord.ui.Modal, title="REKRUTACJA HUNT"):
+
+    dlaczego = discord.ui.TextInput(
+        label="Dlaczego chcesz dołączyć do HUNT?",
+        placeholder="Napisz, dlaczego chcesz dołączyć...",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+    )
+
+    pvp = discord.ui.TextInput(
+        label="Jak oceniasz swoje umiejętności PVP?",
+        placeholder="Opisz swoje umiejętności...",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+    )
+
+    wiek_premium = discord.ui.TextInput(
+        label="Ile masz lat i czy posiadasz premium?",
+        placeholder="Wiek oraz informacja o premium...",
+        max_length=200,
+    )
+
+    main = discord.ui.TextInput(
+        label="Jaki jest Twój główny tryb?",
+        placeholder="Podaj swój główny tryb...",
+        max_length=200,
+    )
+
+    gildie = discord.ui.TextInput(
+        label="W jakich gildiach wcześniej grałeś?",
+        placeholder="Wymień poprzednie gildie...",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = {
+            "Dlaczego chcesz dołączyć do HUNT?": self.dlaczego.value,
+            "Umiejętności PVP": self.pvp.value,
+            "Wiek i konto premium": self.wiek_premium.value,
+            "Główny tryb": self.main.value,
+            "Poprzednie gildie": self.gildie.value,
+        }
+        await create_ticket(interaction, "rekrutacja", answers)
+
+
+class AllianceModal(discord.ui.Modal, title="SOJUSZ HUNT"):
+
+    tag = discord.ui.TextInput(
+        label="Jaki jest TAG Twojej gildii?",
+        placeholder="Podaj TAG gildii...",
+        max_length=100,
+    )
+
+    czlonkowie = discord.ui.TextInput(
+        label="Ilu członków liczy Twoja gildia?",
+        placeholder="Podaj liczbę członków...",
+        max_length=100,
+    )
+
+    lider = discord.ui.TextInput(
+        label="Kto jest liderem gildii?",
+        placeholder="Podaj nick lidera...",
+        max_length=100,
+    )
+
+    serwery = discord.ui.TextInput(
+        label="Na jakich serwerach gracie?",
+        placeholder="Podaj serwery...",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+
+    pvp = discord.ui.TextInput(
+        label="Czy gildia bierze udział w PVP?",
+        placeholder="Napisz coś o aktywności PVP...",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = {
+            "TAG gildii": self.tag.value,
+            "Liczba członków": self.czlonkowie.value,
+            "Lider gildii": self.lider.value,
+            "Serwery": self.serwery.value,
+            "Aktywność PVP": self.pvp.value,
+        }
+        await create_ticket(interaction, "sojusz", answers)
+
+
+class QuestionModal(discord.ui.Modal, title="POMOC / PYTANIE"):
+
+    pytanie = discord.ui.TextInput(
+        label="W czym potrzebujesz pomocy?",
+        placeholder="Opisz swoje pytanie...",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+    )
+
+    problem = discord.ui.TextInput(
+        label="Dodatkowe informacje",
+        placeholder="Możesz podać dodatkowe informacje...",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = {
+            "W czym potrzebujesz pomocy?": self.pytanie.value,
+            "Dodatkowe informacje": self.problem.value,
+        }
+        await create_ticket(interaction, "pytanie", answers)
+
+
+MODALS = {
+    "rekrutacja": RecruitmentModal,
+    "sojusz": AllianceModal,
+    "pytanie": QuestionModal,
+}
+
+# =========================================================
+# MENU WYBORU TICKETA
+# =========================================================
+
+
+class TicketPanelSelect(discord.ui.Select):
+
+    def __init__(self):
+
+        options = [
+            discord.SelectOption(
+                label=data["label"],
+                description=data["description"],
+                value=key,
+                emoji=data["emoji"],
+            )
+            for key, data in TICKET_TYPES.items()
+        ]
+
+        super().__init__(
+            placeholder="Wybierz kategorię ticketa...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="hunt_ticket_category_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        guild = interaction.guild
+
+        # nie męczymy użytkownika formularzem, jeśli ma już ticket
+        if guild:
+            existing = find_open_ticket(guild, interaction.user.id)
+            if existing:
+                await interaction.response.send_message(
+                    f"{EMOJI_WARNING} Masz już otwarty ticket: {existing.mention}",
+                    ephemeral=True,
+                )
+                await self._reset_panel(interaction)
+                return
+
+        modal_class = MODALS.get(self.values[0])
+
+        if modal_class is None:
+            await interaction.response.send_message(
+                f"{EMOJI_WARNING} Nieznana kategoria.", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_modal(modal_class())
+        await self._reset_panel(interaction)
+
+    @staticmethod
+    async def _reset_panel(interaction: discord.Interaction):
+        """Czyści zaznaczenie w menu, żeby można było wybrać tę samą opcję ponownie."""
+        if interaction.message is None:
+            return
+        try:
+            await interaction.message.edit(view=TicketPanel())
+        except discord.HTTPException:
+            pass
+
+
+# =========================================================
+# PANEL TICKETÓW - COMPONENTS V2
+# =========================================================
+
+
+class TicketPanel(discord.ui.LayoutView):
+
+    def __init__(self):
+
+        super().__init__(timeout=None)
+
+        categories = "\n".join(
+            f"{data['emoji']} **{data['label']}** — {data['description']}"
+            for data in TICKET_TYPES.values()
+        )
+
+        container = discord.ui.Container(
+            discord.ui.MediaGallery(
+                discord.MediaGalleryItem(TICKET_IMAGE_URL)
+            ),
+            discord.ui.Separator(
+                visible=True, spacing=discord.SeparatorSpacing.small
+            ),
+            discord.ui.TextDisplay("## 🔪 GILDIA HUNT × SYSTEM TICKET"),
+            discord.ui.TextDisplay(
+                "Wybierz kategorię, która Cię interesuje, i wypełnij formularz.\n"
+                "Zarząd odpowie najszybciej, jak to możliwe — **prosimy nie pingować**."
+            ),
+            discord.ui.Separator(
+                visible=True, spacing=discord.SeparatorSpacing.small
+            ),
+            discord.ui.TextDisplay(categories),
+            discord.ui.Separator(
+                visible=False, spacing=discord.SeparatorSpacing.small
+            ),
+            discord.ui.ActionRow(TicketPanelSelect()),
+            accent_colour=COLOR,
+        )
+
+        self.add_item(container)
+
+
+# =========================================================
 # ZAMYKANIE TICKETÓW
 # =========================================================
+
 
 class CloseTicketView(discord.ui.View):
 
@@ -94,590 +624,126 @@ class CloseTicketView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="ZAMKNIJ TICKET",
-        emoji="🔒",
+        label="Zamknij ticket",
         style=discord.ButtonStyle.danger,
-        custom_id="hunt_close_ticket"
+        emoji="🔒",
+        custom_id="hunt_close_ticket",
     )
-    async def close_ticket(self, interaction, button):
+    async def close_ticket(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
 
-        staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
+        channel = interaction.channel
+        guild = interaction.guild
 
-        is_staff = (
-            interaction.user.guild_permissions.administrator
-            or (
-                staff_role is not None
-                and staff_role in interaction.user.roles
-            )
-        )
-
-        is_owner = (
-            interaction.channel.topic
-            == f"ticket_owner:{interaction.user.id}"
-        )
-
-        if not is_staff and not is_owner:
+        if not isinstance(channel, discord.TextChannel) or guild is None:
             await interaction.response.send_message(
-                "❌ Nie masz uprawnień do zamknięcia ticketu.",
-                ephemeral=True
+                f"{EMOJI_WARNING} Nie można zamknąć tego kanału.", ephemeral=True
             )
             return
 
-        await interaction.response.send_message(
-            "🔒 Ticket zostanie zamknięty za 3 sekundy."
-        )
+        owner = channel.topic == owner_topic(interaction.user.id)
 
-        await asyncio.sleep(3)
-
-        await interaction.channel.delete(
-            reason=f"Ticket zamknięty przez {interaction.user}"
-        )
-
-
-# =========================================================
-# TWORZENIE TICKETU
-# =========================================================
-
-async def create_ticket(interaction, ticket_type, answers):
-
-    guild = interaction.guild
-
-    if guild is None:
-        await interaction.response.send_message(
-            "❌ Nie znaleziono serwera.",
-            ephemeral=True
-        )
-        return
-
-    # WYBÓR KATEGORII W ZALEŻNOŚCI OD TYPU TICKETU
-
-    category_ids = {
-        "Rekrutacja": RECRUITMENT_CATEGORY_ID,
-        "Sojusz": ALLIANCE_CATEGORY_ID,
-        "Pytanie": QUESTION_CATEGORY_ID
-    }
-
-    category_id = category_ids.get(ticket_type)
-
-    if category_id is None:
-        await interaction.response.send_message(
-            "❌ Nie znaleziono konfiguracji tej kategorii ticketu.",
-            ephemeral=True
-        )
-        return
-
-    category = guild.get_channel(category_id)
-    staff_role = guild.get_role(STAFF_ROLE_ID)
-
-    if category is None or not isinstance(category, discord.CategoryChannel):
-        await interaction.response.send_message(
-            f"❌ Nie znaleziono kategorii dla ticketu: {ticket_type}. Sprawdź jej ID.",
-            ephemeral=True
-        )
-        return
-
-    # SPRAWDZANIE OTWARTYCH TICKETÓW
-
-    for existing_channel in category.channels:
-
-        if existing_channel.topic == f"ticket_owner:{interaction.user.id}":
+        if not owner and not is_staff(interaction.user, guild):
             await interaction.response.send_message(
-                f"❌ Masz już otwarty ticket: {existing_channel.mention}",
-                ephemeral=True
+                f"{EMOJI_WARNING} Nie masz uprawnień do zamknięcia tego ticketa.",
+                ephemeral=True,
             )
             return
 
-    # UPRAWNIENIA KANAŁU
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=False
-        ),
-
-        interaction.user: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True
-        )
-    }
-
-    bot_member = guild.get_member(bot.user.id)
-
-    if bot_member:
-        overwrites[bot_member] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            manage_channels=True,
-            read_message_history=True
-        )
-
-    if staff_role:
-        overwrites[staff_role] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True
-        )
-
-    username = interaction.user.name.lower().replace(" ", "-")
-
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        channel = await guild.create_text_channel(
-            name=f"ticket-{username}"[:90],
-            category=category,
-            topic=f"ticket_owner:{interaction.user.id}",
-            overwrites=overwrites
-        )
-
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ Bot nie ma uprawnień do tworzenia kanałów.",
-            ephemeral=True
-        )
-        return
-
-    except discord.HTTPException as e:
-        await interaction.followup.send(
-            f"❌ Błąd tworzenia ticketu: {e}",
-            ephemeral=True
-        )
-        return
-
-    # EMBED TICKETU
-
-    embed = discord.Embed(
-        title=f"GILDIA HUNT × {ticket_type.upper()}",
-        description=(
-            f"👤 **Użytkownik:** {interaction.user.mention}\n"
-            f"📂 **Kategoria:** {ticket_type}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{answers}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🔧 Administracja odpowie, gdy będzie dostępna."
-        ),
-        color=COLOR
-    )
-
-    embed.set_footer(
-        text=f"HUNT • Ticket użytkownika {interaction.user}"
-    )
-
-    await channel.send(
-        content=(
-            f"{interaction.user.mention} "
-            f"{staff_role.mention if staff_role else ''}"
-        ),
-        embed=embed,
-        view=CloseTicketView(),
-        allowed_mentions=discord.AllowedMentions(
-            users=True,
-            roles=True
-        )
-    )
-
-    await interaction.followup.send(
-        f"✅ Twój ticket został utworzony: {channel.mention}",
-        ephemeral=True
-    )
-
-
-# =========================================================
-# FORMULARZ REKRUTACJI
-# =========================================================
-
-class RekrutacjaModal(discord.ui.Modal, title="Rekrutacja HUNT"):
-
-    dlaczego = discord.ui.TextInput(
-        label="Dlaczego chcesz do nas dołączyć?",
-        style=discord.TextStyle.paragraph,
-        max_length=500
-    )
-
-    pvp = discord.ui.TextInput(
-        label="Jak oceniasz swoje PvP?",
-        max_length=200
-    )
-
-    wiek_premium = discord.ui.TextInput(
-        label="Ile masz lat i czy masz Minecraft Premium?",
-        placeholder="Np. 16 lat, tak",
-        max_length=100
-    )
-
-    main = discord.ui.TextInput(
-        label="Jaki tryb mainujesz?",
-        max_length=150
-    )
-
-    gildie = discord.ui.TextInput(
-        label="Byłeś w innych gildiach? Jakich?",
-        style=discord.TextStyle.paragraph,
-        max_length=300
-    )
-
-    async def on_submit(self, interaction):
-
-        answers = (
-            f"👤 **Dlaczego HUNT?**\n{self.dlaczego.value}\n\n"
-            f"⚔️ **Ocena PvP:**\n{self.pvp.value}\n\n"
-            f"🎮 **Wiek i Minecraft Premium:**\n{self.wiek_premium.value}\n\n"
-            f"🎯 **Mainowany tryb:**\n{self.main.value}\n\n"
-            f"🏆 **Poprzednie gildie:**\n{self.gildie.value}"
-        )
-
-        await create_ticket(
-            interaction,
-            "Rekrutacja",
-            answers
-        )
-
-
-# =========================================================
-# FORMULARZ SOJUSZU
-# =========================================================
-
-class SojuszModal(discord.ui.Modal, title="Sojusz HUNT"):
-
-    tag = discord.ui.TextInput(
-        label="Jaki TAG posiada wasza gildia?",
-        max_length=50
-    )
-
-    czlonkowie = discord.ui.TextInput(
-        label="Ilu członków liczy wasza gildia?",
-        max_length=50
-    )
-
-    lider = discord.ui.TextInput(
-        label="Czy jesteś liderem gildii?",
-        placeholder="Jeśli nie, zaproś lidera do ticketu",
-        max_length=100
-    )
-
-    serwery = discord.ui.TextInput(
-        label="Na jakich serwerach gracie?",
-        max_length=200
-    )
-
-    pvp = discord.ui.TextInput(
-        label="Jak oceniacie swoje PvP gildyjne?",
-        style=discord.TextStyle.paragraph,
-        max_length=300
-    )
-
-    async def on_submit(self, interaction):
-
-        answers = (
-            f"🏷️ **TAG gildii:**\n{self.tag.value}\n\n"
-            f"👥 **Liczba członków:**\n{self.czlonkowie.value}\n\n"
-            f"👑 **Czy jesteś liderem?**\n{self.lider.value}\n\n"
-            f"🎮 **Serwery:**\n{self.serwery.value}\n\n"
-            f"⚔️ **PvP gildyjne:**\n{self.pvp.value}"
-        )
-
-        await create_ticket(
-            interaction,
-            "Sojusz",
-            answers
-        )
-
-
-# =========================================================
-# FORMULARZ PYTANIA
-# =========================================================
-
-class PytanieModal(discord.ui.Modal, title="Pytanie HUNT"):
-
-    pytanie = discord.ui.TextInput(
-        label="Opisz swoje pytanie",
-        placeholder="Co chciałbyś wiedzieć?",
-        style=discord.TextStyle.paragraph,
-        max_length=500
-    )
-
-    problem = discord.ui.TextInput(
-        label="Opisz swój problem",
-        placeholder="Opisz dokładnie swój problem...",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=1000
-    )
-
-    async def on_submit(self, interaction):
-
-        answers = (
-            f"❓ **Pytanie:**\n{self.pytanie.value}\n\n"
-            f"🔧 **Opis problemu:**\n"
-            f"{self.problem.value or 'Nie podano'}"
-        )
-
-        await create_ticket(
-            interaction,
-            "Pytanie",
-            answers
-        )
-
-
-# =========================================================
-# MENU WYBORU TICKETÓW
-# =========================================================
-
-class TicketSelect(discord.ui.Select):
-
-    def __init__(self):
-
-        options = [
-            discord.SelectOption(
-                label="Rekrutacja",
-                description="Chcesz dołączyć do gildii HUNT?",
-                emoji="⚔️",
-                value="rekrutacja"
+        embed = discord.Embed(
+            description=(
+                f"🔒 Ticket zostanie zamknięty za **5 sekund**.\n"
+                f"Zamyka: {interaction.user.mention}"
             ),
-
-            discord.SelectOption(
-                label="Sojusz",
-                description="Chcesz nawiązać współpracę z HUNT?",
-                emoji="🤝",
-                value="sojusz"
-            ),
-
-            discord.SelectOption(
-                label="Pytanie",
-                description="Masz pytanie lub problem?",
-                emoji="❓",
-                value="pytanie"
-            )
-        ]
-
-        super().__init__(
-            placeholder="🎫 Wybierz kategorię ticketu...",
-            options=options,
-            custom_id="hunt_ticket_select"
+            color=COLOR,
         )
 
-    async def callback(self, interaction):
+        await interaction.response.send_message(embed=embed)
 
-        if self.values[0] == "rekrutacja":
-            await interaction.response.send_modal(
-                RekrutacjaModal()
+        await asyncio.sleep(5)
+
+        try:
+            await channel.delete(
+                reason=f"Ticket zamknięty przez {interaction.user}"
             )
-
-        elif self.values[0] == "sojusz":
-            await interaction.response.send_modal(
-                SojuszModal()
-            )
-
-        elif self.values[0] == "pytanie":
-            await interaction.response.send_modal(
-                PytanieModal()
-            )
-
-
-class TicketPanel(discord.ui.View):
-
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(TicketSelect())
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            print("Bot nie ma uprawnień do usunięcia kanału.")
+        except discord.HTTPException as error:
+            print(f"Błąd usuwania ticketa: {error}")
 
 
 # =========================================================
-# AUTOMATYCZNY PANEL TICKETÓW
+# WYSYŁANIE PANELU
 # =========================================================
+
 
 async def send_ticket_panel():
 
-    print("Przygotowywanie panelu ticketów HUNT...")
+    try:
+        channel = await bot.fetch_channel(TICKET_PANEL_CHANNEL_ID)
+    except discord.NotFound:
+        print("Nie znaleziono kanału panelu ticketów.")
+        return
+    except discord.Forbidden:
+        print("Bot nie ma dostępu do kanału panelu.")
+        return
 
-    channel = bot.get_channel(TICKET_PANEL_CHANNEL_ID)
-
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(
-                TICKET_PANEL_CHANNEL_ID
-            )
-        except discord.HTTPException as e:
-            print(f"Nie znaleziono kanału ticketów: {e}")
-            return
-
-    embed = discord.Embed(
-        title="🎫 GILDIA HUNT × TICKETY",
-        description=(
-            "Witaj w systemie ticketów **HUNT!**\n\n"
-            "Potrzebujesz pomocy, chcesz dołączyć do gildii "
-            "lub nawiązać sojusz? Wybierz kategorię poniżej.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "⚔️ **Rekrutacja**\n"
-            "Chcesz dołączyć do gildii HUNT?\n\n"
-            "🤝 **Sojusz**\n"
-            "Chcesz nawiązać współpracę z naszą gildią?\n\n"
-            "❓ **Pytanie**\n"
-            "Masz pytanie lub problem?\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "📩 Administracja odpowie, gdy będzie dostępna."
-        ),
-        color=COLOR
-    )
-
-    embed.set_footer(text="HUNT • System ticketów")
+    if not isinstance(channel, discord.TextChannel):
+        print("Podane ID nie jest kanałem tekstowym.")
+        return
 
     try:
-        await channel.send(
-            embed=embed,
-            view=TicketPanel()
-        )
+        # usuwamy stare panele bota, żeby po restarcie nie było duplikatów
+        async for message in channel.history(limit=25):
+            if message.author.id == bot.user.id:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
 
-        print("Panel ticketów HUNT został wysłany!")
+        await channel.send(view=TicketPanel())
+        print("Wysłano panel ticketów HUNT.")
 
-    except discord.HTTPException as e:
-        print(f"Błąd wysyłania panelu: {e}")
+    except discord.Forbidden:
+        print("Bot nie ma uprawnień do wysyłania/usuwania wiadomości w kanale panelu.")
+    except discord.HTTPException as error:
+        print(f"Błąd wysyłania panelu: {error}")
 
 
 # =========================================================
-# START BOTA
+# ON READY
 # =========================================================
-
-@bot.event
-async def setup_hook():
-
-    bot.add_view(TicketPanel())
-    bot.add_view(CloseTicketView())
 
 
 @bot.event
 async def on_ready():
 
-    print(f"Bot {bot.user} działa!")
-    print("System HUNT: powitania, rangi i tickety aktywne.")
+    global panel_sent
 
-    if not getattr(bot, "ticket_panel_sent", False):
+    print("--------------------------------")
+    print(f"Zalogowano jako: {bot.user}")
+    print(f"ID bota: {bot.user.id}")
+    print("--------------------------------")
+
+    if not panel_sent:
+        panel_sent = True
         await send_ticket_panel()
-        bot.ticket_panel_sent = True
 
 
 # =========================================================
-# AUTOMATYCZNA RANGA + POWITANIE
+# URUCHOMIENIE
 # =========================================================
-
-@bot.event
-async def on_member_join(member):
-
-    # AUTOMATYCZNE NADAWANIE RANGI
-
-    role = member.guild.get_role(AUTO_ROLE_ID)
-
-    if role is not None:
-        try:
-            await member.add_roles(
-                role,
-                reason="Automatyczna ranga po wejściu na serwer HUNT"
-            )
-
-            print(f"Nadano rangę {role.name}: {member}")
-
-        except discord.Forbidden:
-            print("Bot nie ma uprawnień do nadawania rangi!")
-
-        except discord.HTTPException as e:
-            print(f"Błąd nadawania rangi: {e}")
-
-    else:
-        print("Nie znaleziono rangi o podanym ID!")
-
-    # POWITANIE
-
-    channel = bot.get_channel(WELCOME_CHANNEL_ID)
-
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(
-                WELCOME_CHANNEL_ID
-            )
-        except discord.HTTPException:
-            print("Nie znaleziono kanału powitań!")
-            return
-
-    embed = create_welcome_embed(member)
-
-    await channel.send(
-        content=f"<:witaj:1567978044956737587> {member.mention}",
-        embed=embed,
-        allowed_mentions=discord.AllowedMentions(
-            users=True,
-            roles=False,
-            everyone=False
-        )
-    )
-
-
-# =========================================================
-# KOMENDA TESTOWA POWITAŃ
-# =========================================================
-
-@bot.command(name="testpowitanie")
-@commands.has_permissions(administrator=True)
-async def test_powitanie(ctx):
-
-    embed = create_welcome_embed(ctx.author)
-
-    await ctx.send(
-        content=f"<:witaj:1567978044956737587> {ctx.author.mention}",
-        embed=embed,
-        allowed_mentions=discord.AllowedMentions(
-            users=True,
-            roles=False,
-            everyone=False
-        )
-    )
-
-
-# =========================================================
-# OBSŁUGA BŁĘDÓW
-# =========================================================
-
-@bot.event
-async def on_command_error(ctx, error):
-
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send(
-            "❌ Nie masz uprawnień do tej komendy!"
-        )
-
-    elif isinstance(error, commands.CommandNotFound):
-        return
-
-    else:
-        raise error
-
-
-# =========================================================
-# START
-# =========================================================
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-    return "Bot Discord działa!", 200
-
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-
-def keep_alive():
-    server = Thread(target=run_web, daemon=True)
-    server.start()
-
-
-keep_alive()
-
 
 if __name__ == "__main__":
 
-    if TOKEN == "TWÓJ_TOKEN":
-        print("USTAW TOKEN BOTA W ZMIENNEJ TOKEN!")
+    if not TOKEN:
+        raise ValueError("Brak tokena! Dodaj DISCORD_TOKEN do pliku .env")
+
+    threading.Thread(target=run_flask, daemon=True).start()
 
     bot.run(TOKEN)
